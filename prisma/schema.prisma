@@ -1,0 +1,101 @@
+// This is your Prisma schema file.
+
+// 1. Tells Prisma how to connect to your database.
+// It reads the connection string from your .env file.
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 2. Tells Prisma to generate the JavaScript client.
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------------------------------------------
+// DATABASE MODELS
+// ----------------------------------------------
+
+// Model for the main company/tenant account
+model Agency {
+  id        String   @id @default(cuid())
+  name      String
+  subdomain String   @unique // For agency-a.markmate.com
+  status    String   @default("active") // active, trial, cancelled
+  createdAt DateTime @default(now())
+
+  // --- Relationships ---
+  // One Agency can have many Users
+  users User[]
+  // One Agency can have many Batches
+  batches UploadBatch[]
+  // One Agency can have many Assessor Credentials
+  assessorCredentials AssessorCredential[]
+}
+
+// Model for the users who log in to YOUR portal
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String   // The hashed password for logging into MarkMate
+  role      String   @default("AGENCY_MEMBER") // SUPERADMIN, AGENCY_ADMIN, AGENCY_MEMBER
+  createdAt DateTime @default(now())
+
+  // --- Relationships ---
+  // A User MUST belong to one Agency
+  // (unless they are a SUPERADMIN)
+  agency    Agency?  @relation(fields: [agencyId], references: [id])
+  agencyId  String?  // '?' means this can be NULL (for superadmins)
+}
+
+// Model for the encrypted credentials for the Skill India portal
+model AssessorCredential {
+  id        String   @id @default(cuid())
+  username  String   // Skill India Portal username
+  password  String   // ENCRYPTED Skill India Portal password
+  createdAt DateTime @default(now())
+
+  // --- Relationships ---
+  // These credentials belong to one Agency
+  agency    Agency   @relation(fields: [agencyId], references: [id])
+  agencyId  String
+}
+
+// Model for a single Excel file upload
+model UploadBatch {
+  id        String   @id @default(cuid())
+  fileName  String
+  status    String   @default("pending") // pending, processing, complete, failed
+  createdAt DateTime @default(now())
+
+  // --- Relationships ---
+  // This batch belongs to one Agency
+  agency    Agency   @relation(fields: [agencyId], references: [id])
+  agencyId  String
+  // One Batch has many Candidates
+  candidates Candidate[]
+}
+
+// Model for a single row in the Excel file
+model Candidate {
+  id           String   @id @default(cuid())
+  candidateId  String   // e.g., "CAN_2963617"
+  status       String   @default("pending") // pending, success, failed
+  errorMessage String?  // Stores the error if it fails
+  
+  // --- All the data from the Excel file ---
+  // You can add more columns here as needed
+  nos1_theory_marks  Int?
+  nos1_practical_marks Int?
+  nos2_theory_marks  Int?
+  nos2_practical_marks Int?
+  // ...etc
+
+  // --- Relationships ---
+  // This candidate belongs to one Batch
+  batch    UploadBatch @relation(fields: [batchId], references: [id])
+  batchId  String
+
+  // Add an index for super-fast lookups
+  @@index([batchId])
+}
