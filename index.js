@@ -6,7 +6,7 @@ import 'dotenv/config';
 // Import our new route files
 import authRoutes from './routes/auth.routes.js';
 import apiRoutes from './routes/api.routes.js';
-
+import credentialRoutes from './routes/credentials.routes.js';
 // Initialize Express App
 const app = express();
 const port = 3001;
@@ -24,6 +24,8 @@ app.use('/auth', authRoutes);
 
 // All other protected routes are at /api
 app.use('/api', apiRoutes);
+
+app.use('/api/credentials', credentialRoutes);
 
 
 // --- Start the Server ---

@@ -94,4 +94,63 @@ router.get('/uploads/:batchId', async (req, res) => {
   res.status(200).json(batch);
 });
 
+router.post('/upload/validate', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded.' });
+    }
+
+    const workbook = new exceljs.Workbook();
+    await workbook.xlsx.load(req.file.buffer);
+    const worksheet = workbook.getWorksheet(1);
+
+    let totalRows = 0;
+    let validRows = 0;
+    let nosCount = 0;
+    const warnings = [];
+
+    // 1. Get NOS count from header
+    const headerRow = worksheet.getRow(1);
+    headerRow.eachCell((cell, colNumber) => {
+      if (cell.value.toString().startsWith('NOS')) {
+        nosCount++;
+      }
+    });
+
+    // 2. Loop through all rows for validation
+    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      if (rowNumber === 1) return; // Skip header
+
+      totalRows++; // Count every row after the header
+
+      const candidateId = row.values[1];
+      const nos1Theory = row.values[2];
+
+      // Simple validation example
+      if (!candidateId) {
+        warnings.push(`Row ${rowNumber}: Missing Candidate_ID`);
+      } else if (!nos1Theory) {
+        // This is a "warning," not a failure
+        warnings.push(`Row ${rowNumber}, ${candidateId}: Missing marks for NOS1_Theory`);
+      } else {
+        // If it has the minimum data, it's a "valid" row
+        validRows++;
+      }
+    });
+
+    res.status(200).json({
+      status: warnings.length > 0 ? 'Valid with warnings' : 'Valid',
+      totalRows: totalRows,
+      validRows: validRows,
+      candidates: validRows, // Assuming 1 candidate per valid row
+      nosCount: nosCount,
+      warnings: warnings,
+    });
+
+  } catch (error) {
+    console.error('Validation failed:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
 export default router;

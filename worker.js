@@ -1,5 +1,6 @@
 // worker.js (The Bot)
 import { Worker } from 'bullmq';
+import { decrypt } from './utils/cryptoHelper.js';
 import { PrismaClient } from '@prisma/client';
 import { chromium } from 'playwright';
 import 'dotenv/config';
@@ -12,6 +13,8 @@ const connection = new IORedis(process.env.REDIS_URL, {
   maxRetriesPerRequest: null,
   tls: {},
 });
+
+const secretKey = process.env.CREDENTIAL_SECRET; // <-- ADD THIS
 
 // --- SELECTORS (from our POC) ---
 const USERNAME_SELECTOR = 'input[formcontrolname="UserName"]';
@@ -40,7 +43,7 @@ const processJob = async (job) => {
     
     // TODO: Decrypt this password!
     const USERNAME = credential.username; 
-    const PASSWORD = credential.password;
+    const PASSWORD = decrypt(credential.password)
 
     // 2. --- LAUNCH THE BOT & LOGIN ---
     console.log('[Worker] Launching browser...');
