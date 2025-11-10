@@ -188,6 +188,88 @@ router.get('/uploads', async (req, res) => {
   }
 });
 
+// --- NEW: GET /api/dashboard/stats ---
+// Gets all the stats and recent activity for the main dashboard page
+router.get('/dashboard/stats', async (req, res) => {
+  try {
+    const { agencyId } = req.user;
+
+    // --- 1. Define Time Ranges ---
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const thirtyDaysAgo = new Date(new Date().setDate(now.getDate() - 30));
+
+    // --- 2. Run All Queries in Parallel ---
+    const [
+      totalUploads,
+      pendingUploads,
+      completedToday,
+      recentActivity,
+      thirtyDayStats
+    ] = await prisma.$transaction([
+      
+      // Total Uploads
+      prisma.uploadBatch.count({
+        where: { agencyId: agencyId }
+      }),
+
+      // Pending Uploads
+      prisma.uploadBatch.count({
+        where: {
+          agencyId: agencyId,
+          status: { in: ['pending', 'processing'] }
+        }
+      }),
+
+      // Completed Today
+      prisma.uploadBatch.count({
+        where: {
+          agencyId: agencyId,
+          status: 'complete',
+          completedAt: { gte: today } // gte = "greater than or equal to"
+        }
+      }),
+
+      // Recent Activity (Latest 3)
+      prisma.uploadBatch.findMany({
+        where: { agencyId: agencyId },
+        orderBy: { createdAt: 'desc' },
+        take: 3
+      }),
+
+      // Stats for Success Rate (Last 30 Days)
+      prisma.uploadBatch.findMany({
+        where: {
+          agencyId: agencyId,
+          status: { in: ['complete', 'failed'] },
+          completedAt: { gte: thirtyDaysAgo }
+        },
+        select: { status: true }
+      })
+    ]);
+
+    // --- 3. Calculate Success Rate ---
+    let successRate = 'N/A'; // Default to N/A
+    if (thirtyDayStats.length > 0) {
+      const completed = thirtyDayStats.filter(b => b.status === 'complete').length;
+      successRate = Math.round((completed / thirtyDayStats.length) * 100);
+    }
+
+    // --- 4. Send the Response ---
+    res.status(200).json({
+      totalUploads: totalUploads,
+      pendingUploads: pendingUploads,
+      completedToday: completedToday,
+      successRate: successRate, // Will be a number or "N/A"
+      recentActivity: recentActivity
+    });
+
+  } catch (error) {
+    console.error('Failed to get dashboard stats:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
 // --- UPDATED: GET /api/uploads/stats (with Avg. Duration) ---
 router.get('/uploads/stats', async (req, res) => {
   try {
