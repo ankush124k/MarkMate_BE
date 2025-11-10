@@ -16,86 +16,80 @@ generator client {
 // DATABASE MODELS
 // ----------------------------------------------
 
-// Model for the main company/tenant account
 model Agency {
-  id        String   @id @default(cuid())
-  name      String
-  subdomain String   @unique // For agency-a.markmate.com
-  status    String   @default("active") // active, trial, cancelled
-  createdAt DateTime @default(now())
-
-  // --- Relationships ---
-  // One Agency can have many Users
-  users User[]
-  // One Agency can have many Batches
-  batches UploadBatch[]
-  // One Agency can have many Assessor Credentials
+  id                  String                 @id @default(cuid())
+  name                String
+  subdomain           String                 @unique // For agency-a.markmate.com
+  status              String                 @default("active") // active, trial, cancelled
+  createdAt           DateTime               @default(now())
+  users               User[]
+  batches             UploadBatch[]
   assessorCredentials AssessorCredential[]
 }
 
-// Model for the users who log in to YOUR portal
 model User {
   id        String   @id @default(cuid())
   email     String   @unique
-  password  String   // The hashed password for logging into MarkMate
+  password  String // The hashed password for logging into MarkMate
   role      String   @default("AGENCY_MEMBER") // SUPERADMIN, AGENCY_ADMIN, AGENCY_MEMBER
   createdAt DateTime @default(now())
-
-  // --- Relationships ---
-  // A User MUST belong to one Agency
-  // (unless they are a SUPERADMIN)
   agency    Agency?  @relation(fields: [agencyId], references: [id])
-  agencyId  String?  // '?' means this can be NULL (for superadmins)
+  agencyId  String? // '?' means this can be NULL (for superadmins)
 }
 
-// Model for the encrypted credentials for the Skill India portal
 model AssessorCredential {
   id        String   @id @default(cuid())
-  username  String   // Skill India Portal username
-  password  String   // ENCRYPTED Skill India Portal password
+  username  String
+  password  String // ENCRYPTED Skill India Portal password
   createdAt DateTime @default(now())
-
-  // --- Relationships ---
-  // These credentials belong to one Agency
   agency    Agency   @relation(fields: [agencyId], references: [id])
   agencyId  String
+
+  // --- Relationships ---
+  // One credential can be used for many batches
+  uploadBatches UploadBatch[] // <-- NEW
 }
 
 // Model for a single Excel file upload
 model UploadBatch {
-  id        String   @id @default(cuid())
-  fileName  String
-  status    String   @default("pending") // pending, processing, complete, failed
-  createdAt DateTime @default(now())
+  id            String    @id @default(cuid())
+  fileName      String
+  portalBatchId String // <-- NEW: The ID from the Skill India Portal (e.g., "42856")
+  status        String    @default("pending") // pending, processing, complete, failed
+  createdAt     DateTime  @default(now())
+  startedAt     DateTime? // <-- NEW: Set when the worker starts the job
+  completedAt   DateTime? // <-- NEW: Set when the worker finishes or fails
 
   // --- Relationships ---
-  // This batch belongs to one Agency
   agency    Agency   @relation(fields: [agencyId], references: [id])
   agencyId  String
-  // One Batch has many Candidates
+  
+  // Link to the credential that was used for this job
+  assessorCredential   AssessorCredential? @relation(fields: [assessorCredentialId], references: [id]) // <-- NEW
+  assessorCredentialId String? // <-- NEW: The credential selected by the user
+
   candidates Candidate[]
+  
+  @@index([portalBatchId]) // <-- NEW: Add index for searching
 }
 
 // Model for a single row in the Excel file
 model Candidate {
   id           String   @id @default(cuid())
-  candidateId  String   // e.g., "CAN_2963617"
+  candidateId  String // e.g., "CAN_2963617"
+  candidateName String? // <-- NEW: "Rajesh Kumar"
   status       String   @default("pending") // pending, success, failed
-  errorMessage String?  // Stores the error if it fails
+  errorMessage String? // Stores the error if it fails
   
   // --- All the data from the Excel file ---
-  // You can add more columns here as needed
-  nos1_theory_marks  Int?
+  nos1_theory_marks    Int?
   nos1_practical_marks Int?
-  nos2_theory_marks  Int?
+  nos2_theory_marks    Int?
   nos2_practical_marks Int?
   // ...etc
 
-  // --- Relationships ---
-  // This candidate belongs to one Batch
   batch    UploadBatch @relation(fields: [batchId], references: [id])
   batchId  String
 
-  // Add an index for super-fast lookups
   @@index([batchId])
 }

@@ -3,8 +3,9 @@ import express from 'express';
 import { PrismaClient } from '@prisma/client';
 import multer from 'multer';
 import exceljs from 'exceljs';
-import { uploadQueue } from '../queue.js'; // Note the ../
-import { authMiddleware } from '../auth.js'; // Note the ../
+import { stringify } from 'csv-stringify';
+import { uploadQueue } from '../queue.js';
+import { authMiddleware } from '../auth.js';
 
 const prisma = new PrismaClient();
 const router = express.Router();
@@ -16,27 +17,97 @@ const upload = multer({ storage: storage });
 // All routes in this file are protected by the authMiddleware
 router.use(authMiddleware);
 
-// GET /api/profile
+// --- GET /api/profile ---
 router.get('/profile', async (req, res) => {
   const user = await prisma.user.findUnique({
     where: { id: req.user.userId },
-    select: { id: true, email: true, role: true, agencyId: true }
+    select: { id: true, email: true, role: true, agencyId: true },
   });
   if (!user) return res.status(404).json({ message: 'User not found.' });
   res.status(200).json(user);
 });
 
-// POST /api/upload
-router.post('/upload', upload.single('file'), async (req, res) => {
+// --- POST /api/upload/validate ---
+// This is now updated to check for 'Candidate_Name'
+router.post('/upload/validate', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
-    const { agencyId } = req.user;
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded.' });
+    }
+    const workbook = new exceljs.Workbook();
+    await workbook.xlsx.load(req.file.buffer);
+    const worksheet = workbook.getWorksheet(1);
+    let totalRows = 0,
+      validRows = 0,
+      nosCount = 0;
+    const warnings = [];
 
+    const headerRow = worksheet.getRow(1);
+    headerRow.eachCell((cell, colNumber) => {
+      if (cell.value && cell.value.toString().startsWith('NOS')) {
+        nosCount++;
+      }
+    });
+
+    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+      if (rowNumber === 1) return;
+      totalRows++;
+      const candidateId = row.values[1];
+      const candidateName = row.values[2]; // <-- Check for name
+      const nos1Theory = row.values[3]; // <-- Column is now 3
+
+      if (!candidateId) {
+        warnings.push(`Row ${rowNumber}: Missing Candidate_ID`);
+      } else if (!candidateName) {
+        warnings.push(`Row ${rowNumber}, ${candidateId}: Missing Candidate_Name`);
+      } else if (!nos1Theory) {
+        warnings.push(
+          `Row ${rowNumber}, ${candidateId}: Missing marks for NOS1_Theory`
+        );
+      } else {
+        validRows++;
+      }
+    });
+
+    res.status(200).json({
+      status: warnings.length > 0 ? 'Valid with warnings' : 'Valid',
+      totalRows: totalRows,
+      validRows: validRows,
+      candidates: validRows,
+      nosCount: nosCount,
+      warnings: warnings,
+    });
+  } catch (error) {
+    console.error('Validation failed:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+// --- POST /api/upload ---
+// This is now updated to accept the assessor and batch IDs
+router.post('/upload', authMiddleware, upload.single('file'), async (req, res) => {
+  try {
+    const { agencyId } = req.user;
+    // --- UPDATED: Get IDs from the form body ---
+    const { assessorCredentialId, portalBatchId } = req.body;
+
+    if (!req.file) {
+      return res.status(400).json({ message: 'No file uploaded.' });
+    }
+    if (!assessorCredentialId || !portalBatchId) {
+      return res
+        .status(400)
+        .json({ message: 'Assessor ID and Portal Batch ID are required.' });
+    }
+
+    // --- UPDATED: Save new fields to the batch ---
     const batch = await prisma.uploadBatch.create({
       data: {
         fileName: req.file.originalname,
         status: 'pending',
         agencyId: agencyId,
+        assessorCredentialId: assessorCredentialId, // <-- Save credential
+        portalBatchId: portalBatchId, // <-- Save batch ID
       },
     });
 
@@ -46,11 +117,14 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     const candidatesToCreate = [];
 
     worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-      if (rowNumber === 1) return; // Skip header
+      if (rowNumber === 1) return;
+
+      // --- UPDATED: Parse new fields ---
       candidatesToCreate.push({
         candidateId: row.values[1].toString(),
-        nos1_theory_marks: parseInt(row.values[2]),
-        nos1_practical_marks: parseInt(row.values[3]),
+        candidateName: row.values[2] ? row.values[2].toString() : null, // <-- Save name
+        nos1_theory_marks: parseInt(row.values[3]),
+        nos1_practical_marks: parseInt(row.values[4]),
         batchId: batch.id,
       });
     });
@@ -69,86 +143,194 @@ router.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// GET /api/uploads
+// --- ENHANCED: GET /api/uploads (Pagination) ---
 router.get('/uploads', async (req, res) => {
-  const { agencyId } = req.user;
-  const batches = await prisma.uploadBatch.findMany({
-    where: { agencyId: agencyId },
-    orderBy: { createdAt: 'desc' },
-  });
-  res.status(200).json(batches);
-});
-
-// GET /api/uploads/:batchId
-router.get('/uploads/:batchId', async (req, res) => {
-  const { agencyId } = req.user;
-  const { batchId } = req.params;
-  const batch = await prisma.uploadBatch.findUnique({
-    where: { id: batchId },
-    include: { candidates: true },
-  });
-
-  if (!batch || batch.agencyId !== agencyId) {
-    return res.status(404).json({ message: 'Batch not found.' });
-  }
-  res.status(200).json(batch);
-});
-
-router.post('/upload/validate', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded.' });
+    const { agencyId } = req.user;
+    const { search, status, page = 1, limit = 10 } = req.query;
+
+    const where = { agencyId: agencyId };
+    if (search) {
+      where.OR = [
+        { fileName: { contains: search, mode: 'insensitive' } },
+        { portalBatchId: { contains: search, mode: 'insensitive' } }, // <-- Search by portal ID
+      ];
+    }
+    if (status) {
+      where.status = status;
     }
 
-    const workbook = new exceljs.Workbook();
-    await workbook.xlsx.load(req.file.buffer);
-    const worksheet = workbook.getWorksheet(1);
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
+    const skip = (pageNum - 1) * limitNum;
 
-    let totalRows = 0;
-    let validRows = 0;
-    let nosCount = 0;
-    const warnings = [];
-
-    // 1. Get NOS count from header
-    const headerRow = worksheet.getRow(1);
-    headerRow.eachCell((cell, colNumber) => {
-      if (cell.value.toString().startsWith('NOS')) {
-        nosCount++;
-      }
-    });
-
-    // 2. Loop through all rows for validation
-    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-      if (rowNumber === 1) return; // Skip header
-
-      totalRows++; // Count every row after the header
-
-      const candidateId = row.values[1];
-      const nos1Theory = row.values[2];
-
-      // Simple validation example
-      if (!candidateId) {
-        warnings.push(`Row ${rowNumber}: Missing Candidate_ID`);
-      } else if (!nos1Theory) {
-        // This is a "warning," not a failure
-        warnings.push(`Row ${rowNumber}, ${candidateId}: Missing marks for NOS1_Theory`);
-      } else {
-        // If it has the minimum data, it's a "valid" row
-        validRows++;
-      }
-    });
+    const [batches, total] = await prisma.$transaction([
+      prisma.uploadBatch.findMany({
+        where: where,
+        orderBy: { createdAt: 'desc' },
+        skip: skip,
+        take: limitNum,
+      }),
+      prisma.uploadBatch.count({ where: where }),
+    ]);
 
     res.status(200).json({
-      status: warnings.length > 0 ? 'Valid with warnings' : 'Valid',
-      totalRows: totalRows,
-      validRows: validRows,
-      candidates: validRows, // Assuming 1 candidate per valid row
-      nosCount: nosCount,
-      warnings: warnings,
+      data: batches,
+      pagination: {
+        totalItems: total,
+        currentPage: pageNum,
+        totalPages: Math.ceil(total / limitNum),
+      },
+    });
+  } catch (error) {
+    console.error('Failed to get batches:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+// --- UPDATED: GET /api/uploads/stats (with Avg. Duration) ---
+router.get('/uploads/stats', async (req, res) => {
+  try {
+    const { agencyId } = req.user;
+
+    const allBatches = await prisma.uploadBatch.findMany({
+      where: { agencyId: agencyId },
+      select: {
+        status: true,
+        startedAt: true, // <-- Get new fields
+        completedAt: true, // <-- Get new fields
+      },
     });
 
+    let totalDurationMs = 0;
+    const finishedBatches = allBatches.filter(
+      (batch) => batch.status === 'complete' || batch.status === 'failed'
+    );
+
+    const totalUploads = allBatches.length;
+    const failedUploads = finishedBatches.filter(
+      (batch) => batch.status === 'failed'
+    ).length;
+    const completedUploads = finishedBatches.filter(
+      (batch) => batch.status === 'complete'
+    ).length;
+
+    // --- Calculate Avg. Duration ---
+    let avgDuration = 'N/A';
+    if (finishedBatches.length > 0) {
+      finishedBatches.forEach((batch) => {
+        if (batch.startedAt && batch.completedAt) {
+          totalDurationMs +=
+            batch.completedAt.getTime() - batch.startedAt.getTime();
+        }
+      });
+
+      if (totalDurationMs > 0) {
+        const avgMs = totalDurationMs / finishedBatches.length;
+        // Format to "Xm Ys"
+        const totalSeconds = Math.floor(avgMs / 1000);
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        avgDuration = `${minutes}m ${seconds}s`;
+      }
+    }
+
+    let successRate = 0;
+    if (totalUploads > 0) {
+      const totalAttempted = completedUploads + failedUploads;
+      if (totalAttempted > 0) {
+        successRate = Math.round((completedUploads / totalAttempted) * 100);
+      }
+    }
+
+    res.status(200).json({
+      totalUploads: totalUploads,
+      successRate: successRate,
+      failedUploads: failedUploads,
+      avgDuration: avgDuration, // <-- Send the calculated value
+    });
   } catch (error) {
-    console.error('Validation failed:', error);
+    console.error('Failed to get upload stats:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+// --- GET /api/uploads/export/csv ---
+router.get('/uploads/export/csv', async (req, res) => {
+  try {
+    const { agencyId } = req.user;
+    const { search, status } = req.query;
+
+    const where = { agencyId: agencyId };
+    if (search) {
+      where.OR = [
+        { fileName: { contains: search, mode: 'insensitive' } },
+        { portalBatchId: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+    if (status) {
+      where.status = status;
+    }
+
+    const batches = await prisma.uploadBatch.findMany({
+      where: where,
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const columns = [
+      { key: 'id', header: 'Internal_Batch_ID' },
+      { key: 'portalBatchId', header: 'Portal_Batch_ID' }, // <-- Add new column
+      { key: 'fileName', header: 'File_Name' },
+      { key: 'status', header: 'Status' },
+      { key: 'createdAt', header: 'Upload_Date' },
+    ];
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader(
+      'Content-Disposition',
+      'attachment; filename="MarkMate_Export.csv"'
+    );
+
+    const stringifier = stringify({ header: true, columns: columns });
+    stringifier.pipe(res);
+    batches.forEach((batch) => stringifier.write(batch));
+    stringifier.end();
+  } catch (error) {
+    console.error('Failed to export CSV:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+// --- GET /api/uploads/:batchId ---
+router.get('/uploads/:batchId', async (req, res) => {
+  try {
+    const { agencyId } = req.user;
+    const { batchId } = req.params;
+
+    const batch = await prisma.uploadBatch.findUnique({
+      where: { id: batchId },
+      include: {
+        candidates: true,
+      },
+    });
+
+    if (!batch || batch.agencyId !== agencyId) {
+      return res.status(404).json({ message: 'Batch not found.' });
+    }
+
+    const summary = {
+      totalCandidates: batch.candidates.length,
+      completed: batch.candidates.filter((c) => c.status === 'success').length,
+      failed: batch.candidates.filter((c) => c.status === 'failed').length,
+      pending: batch.candidates.filter((c) => c.status === 'pending').length,
+    };
+
+    res.status(200).json({
+      ...batch,
+      summary: summary,
+    });
+  } catch (error) {
+    console.error('Failed to get batch status:', error);
     res.status(500).json({ message: 'Internal server error.' });
   }
 });
