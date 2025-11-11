@@ -383,30 +383,48 @@ router.get('/uploads/export/csv', async (req, res) => {
   }
 });
 
-// --- GET /api/uploads/:batchId ---
+// --- MODIFIED: GET /api/uploads/:batchId ---
+// This route now *only* gets the batch details and summary,
+// NOT the full candidate list. This is much faster.
 router.get('/uploads/:batchId', async (req, res) => {
   try {
     const { agencyId } = req.user;
     const { batchId } = req.params;
 
+    // 1. Get the batch itself
     const batch = await prisma.uploadBatch.findUnique({
       where: { id: batchId },
-      include: {
-        candidates: true,
-      },
     });
 
+    // 2. Security check
     if (!batch || batch.agencyId !== agencyId) {
       return res.status(404).json({ message: 'Batch not found.' });
     }
+    
+    // 3. Get the candidate counts using an efficient query
+    const counts = await prisma.candidate.groupBy({
+      by: ['status'],
+      where: { batchId: batchId },
+      _count: { _all: true },
+    });
 
+    // 4. Format the counts into a summary object
     const summary = {
-      totalCandidates: batch.candidates.length,
-      completed: batch.candidates.filter((c) => c.status === 'success').length,
-      failed: batch.candidates.filter((c) => c.status === 'failed').length,
-      pending: batch.candidates.filter((c) => c.status === 'pending').length,
+      totalCandidates: 0,
+      completed: 0,
+      failed: 0,
+      pending: 0,
     };
 
+    for (const group of counts) {
+      const count = group._count._all;
+      summary.totalCandidates += count;
+      if (group.status === 'success') summary.completed = count;
+      else if (group.status === 'failed') summary.failed = count;
+      else if (group.status === 'pending') summary.pending = count;
+    }
+
+    // 5. Send the batch data + the summary
     res.status(200).json({
       ...batch,
       summary: summary,
@@ -416,5 +434,72 @@ router.get('/uploads/:batchId', async (req, res) => {
     res.status(500).json({ message: 'Internal server error.' });
   }
 });
+
+
+// --- NEW: GET /api/uploads/:batchId/candidates ---
+// This new route provides the paginated, searchable, and
+// filterable list of candidates for the "Upload Status" page.
+router.get('/uploads/:batchId/candidates', async (req, res) => {
+  try {
+    const { agencyId } = req.user;
+    const { batchId } = req.params;
+    const { search, status, page = 1, limit = 10 } = req.query;
+
+    // 1. Security Check: Verify this batch belongs to the logged-in user's agency.
+    const batch = await prisma.uploadBatch.findUnique({
+      where: { id: batchId },
+    });
+    if (!batch || batch.agencyId !== agencyId) {
+      return res.status(404).json({ message: 'Batch not found.' });
+    }
+
+    // 2. Build the dynamic 'where' clause for filtering candidates
+    const where = {
+      batchId: batchId,
+    };
+    if (status) {
+      where.status = status;
+    }
+    if (search) {
+      // Search by Candidate ID or Candidate Name
+      where.OR = [
+        { candidateId: { contains: search, mode: 'insensitive' } },
+        { candidateName: { contains: search, mode: 'insensitive' } },
+      ];
+    }
+
+    // 3. Get pagination values
+    const pageNum = parseInt(page, 10);
+    const limitNum = parseInt(limit, 10);
+    const skip = (pageNum - 1) * limitNum;
+
+    // 4. Run parallel queries
+    const [candidates, total] = await prisma.$transaction([
+      // Query 1: Get the paginated list of candidates
+      prisma.candidate.findMany({
+        where: where,
+        orderBy: { candidateId: 'asc' },
+        skip: skip,
+        take: limitNum,
+      }),
+      // Query 2: Get the total count of candidates that match the filter
+      prisma.candidate.count({ where: where }),
+    ]);
+
+    // 5. Send the paginated response
+    res.status(200).json({
+      data: candidates,
+      pagination: {
+        totalItems: total,
+        currentPage: pageNum,
+        totalPages: Math.ceil(total / limitNum),
+      },
+    });
+  } catch (error) {
+    console.error('Failed to get candidates:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
 
 export default router;
