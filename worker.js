@@ -192,7 +192,8 @@ const processJob = async (job) => {
       where: { id: batchId }, 
       data: { 
         status: 'failed',
-        completedAt: new Date()
+        completedAt: new Date(),
+        errorMessage: error.message.substring(0, 255)
       }
     });
     throw error;

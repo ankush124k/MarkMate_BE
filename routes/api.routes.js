@@ -228,16 +228,39 @@ router.get('/dashboard/stats', async (req, res) => {
 // --- GET /api/uploads/active ---
 // ... (This code does not change)
 router.get('/uploads/active', async (req, res) => {
-  // ... (same as before)
   try {
     const { agencyId } = req.user;
-    const activeBatch = await prisma.uploadBatch.findFirst({
+
+    // Step 1: Try to find a batch that is *currently processing*
+    let batchToShow = await prisma.uploadBatch.findFirst({
       where: {
         agencyId: agencyId,
         status: 'processing',
       },
+      orderBy: {
+        startedAt: 'desc' // Get the most recent processing one
+      }
     });
-    res.status(200).json(activeBatch);
+
+    // Step 2: If no batch is processing, find the *last completed or failed* batch
+    if (!batchToShow) {
+      batchToShow = await prisma.uploadBatch.findFirst({
+        where: {
+          agencyId: agencyId,
+          status: { in: ['complete', 'failed'] }, // Look for finished jobs
+        },
+        orderBy: {
+          completedAt: 'desc', // Get the most recent one
+        },
+      });
+    }
+
+    // This will return:
+    // 1. The currently processing batch (if one exists)
+    // 2. OR the last finished batch (if one exists)
+    // 3. OR null (if no jobs have ever been run)
+    res.status(200).json(batchToShow);
+
   } catch (error) {
     console.error('Failed to get active batch:', error);
     res.status(500).json({ message: 'Internal server error.' });
