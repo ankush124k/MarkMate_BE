@@ -10,15 +10,43 @@ import { authMiddleware } from '../auth.js';
 const prisma = new PrismaClient();
 const router = express.Router();
 
-// Setup Multer
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// All routes in this file are protected by the authMiddleware
 router.use(authMiddleware);
+
+// --- Helper function to parse dynamic NOS columns ---
+const parseNosHeaders = (headerRow) => {
+  const nosMap = new Map();
+  const headers = [];
+
+  headerRow.eachCell((cell, colNumber) => {
+    const header = cell.value ? cell.value.toString() : '';
+    headers.push(header);
+
+    if (header.startsWith('NOS') && (header.endsWith('_Theory') || header.endsWith('_Practical'))) {
+      const [nosPart, type] = header.split('_'); // e.g., "NOS1", "Theory"
+      
+      if (!nosMap.has(nosPart)) {
+        nosMap.set(nosPart, { nosIdentifier: nosPart });
+      }
+
+      if (type === 'Theory') {
+        nosMap.get(nosPart).theoryCol = colNumber;
+      } else if (type === 'Practical') {
+        nosMap.get(nosPart).practicalCol = colNumber;
+      }
+    }
+  });
+
+  // Return the list of headers and the structured NOS map
+  return { headers, nosGroups: Array.from(nosMap.values()) };
+};
+
 
 // --- GET /api/profile ---
 router.get('/profile', async (req, res) => {
+  // ... (This code does not change)
   const user = await prisma.user.findUnique({
     where: { id: req.user.userId },
     select: { id: true, email: true, role: true, agencyId: true },
@@ -28,7 +56,7 @@ router.get('/profile', async (req, res) => {
 });
 
 // --- POST /api/upload/validate ---
-// This is now updated to check for 'Candidate_Name'
+// This is now simpler and more flexible
 router.post('/upload/validate', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -37,44 +65,31 @@ router.post('/upload/validate', upload.single('file'), async (req, res) => {
     const workbook = new exceljs.Workbook();
     await workbook.xlsx.load(req.file.buffer);
     const worksheet = workbook.getWorksheet(1);
-    let totalRows = 0,
-      validRows = 0,
-      nosCount = 0;
+    let totalRows = 0;
     const warnings = [];
 
-    const headerRow = worksheet.getRow(1);
-    headerRow.eachCell((cell, colNumber) => {
-      if (cell.value && cell.value.toString().startsWith('NOS')) {
-        nosCount++;
-      }
-    });
+    const { headers, nosGroups } = parseNosHeaders(worksheet.getRow(1));
 
     worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
       if (rowNumber === 1) return;
       totalRows++;
-      const candidateId = row.values[1];
-      const candidateName = row.values[2]; // <-- Check for name
-      const nos1Theory = row.values[3]; // <-- Column is now 3
+      const candidateId = row.values[headers.indexOf('Candidate_ID') + 1];
+      const candidateName = row.values[headers.indexOf('Candidate_Name') + 1];
 
       if (!candidateId) {
         warnings.push(`Row ${rowNumber}: Missing Candidate_ID`);
-      } else if (!candidateName) {
-        warnings.push(`Row ${rowNumber}, ${candidateId}: Missing Candidate_Name`);
-      } else if (!nos1Theory) {
-        warnings.push(
-          `Row ${rowNumber}, ${candidateId}: Missing marks for NOS1_Theory`
-        );
-      } else {
-        validRows++;
+      }
+      if (!candidateName) {
+        warnings.push(`Row ${rowNumber}: Missing Candidate_Name`);
       }
     });
 
     res.status(200).json({
       status: warnings.length > 0 ? 'Valid with warnings' : 'Valid',
       totalRows: totalRows,
-      validRows: validRows,
-      candidates: validRows,
-      nosCount: nosCount,
+      validRows: totalRows - warnings.length,
+      candidates: totalRows,
+      nosCount: nosGroups.length, // Correctly counts the NOS pairs
       warnings: warnings,
     });
   } catch (error) {
@@ -84,58 +99,73 @@ router.post('/upload/validate', upload.single('file'), async (req, res) => {
 });
 
 // --- POST /api/upload ---
-// This is now updated to accept the assessor and batch IDs
+// This is now rewritten to use the new flexible schema
 router.post('/upload', authMiddleware, upload.single('file'), async (req, res) => {
   try {
     const { agencyId } = req.user;
-    // --- UPDATED: Get IDs from the form body ---
     const { assessorCredentialId, portalBatchId } = req.body;
 
-    if (!req.file) {
-      return res.status(400).json({ message: 'No file uploaded.' });
-    }
-    if (!assessorCredentialId || !portalBatchId) {
-      return res
-        .status(400)
-        .json({ message: 'Assessor ID and Portal Batch ID are required.' });
+    if (!req.file || !assessorCredentialId || !portalBatchId) {
+      return res.status(400).json({ message: 'File, Assessor ID, and Portal Batch ID are required.' });
     }
 
-    // --- UPDATED: Save new fields to the batch ---
+    const workbook = new exceljs.Workbook();
+    await workbook.xlsx.load(req.file.buffer);
+    const worksheet = workbook.getWorksheet(1);
+    
+    // 1. Parse the dynamic headers
+    const headerRow = worksheet.getRow(1);
+    const { headers, nosGroups } = parseNosHeaders(headerRow);
+    const idCol = headers.indexOf('Candidate_ID') + 1;
+    const nameCol = headers.indexOf('Candidate_Name') + 1;
+
+    // 2. Create the main batch record
     const batch = await prisma.uploadBatch.create({
       data: {
         fileName: req.file.originalname,
         status: 'pending',
         agencyId: agencyId,
-        assessorCredentialId: assessorCredentialId, // <-- Save credential
-        portalBatchId: portalBatchId, // <-- Save batch ID
+        assessorCredentialId: assessorCredentialId,
+        portalBatchId: portalBatchId,
+        excelHeaders: headers, // Save the headers as JSON
       },
     });
 
-    const workbook = new exceljs.Workbook();
-    await workbook.xlsx.load(req.file.buffer);
-    const worksheet = workbook.getWorksheet(1);
-    const candidatesToCreate = [];
+    // 3. Loop through data rows and create Candidates + Marks
+    for (const row of worksheet.getRows(2, worksheet.rowCount - 1)) {
+      const candidateId = row.getCell(idCol).value.toString();
+      const candidateName = row.getCell(nameCol).value ? row.getCell(nameCol).value.toString() : null;
 
-    worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
-      if (rowNumber === 1) return;
-
-      // --- UPDATED: Parse new fields ---
-      candidatesToCreate.push({
-        candidateId: row.values[1].toString(),
-        candidateName: row.values[2] ? row.values[2].toString() : null, // <-- Save name
-        nos1_theory_marks: parseInt(row.values[3]),
-        nos1_practical_marks: parseInt(row.values[4]),
-        batchId: batch.id,
+      // Create the main Candidate record
+      const newCandidate = await prisma.candidate.create({
+        data: {
+          candidateId: candidateId,
+          candidateName: candidateName,
+          excelRowIndex: row.number,
+          batchId: batch.id,
+        },
       });
-    });
 
-    await prisma.candidate.createMany({ data: candidatesToCreate });
+      // Create all the related marks for this candidate
+      const marksToCreate = nosGroups.map(nos => ({
+        nosIdentifier: nos.nosIdentifier,
+        theoryMarks: nos.theoryCol ? parseInt(row.getCell(nos.theoryCol).value) : null,
+        practicalMarks: nos.practicalCol ? parseInt(row.getCell(nos.practicalCol).value) : null,
+        candidateId: newCandidate.id,
+      }));
+
+      await prisma.candidateMark.createMany({
+        data: marksToCreate,
+      });
+    }
+
+    // 4. Add the job to the queue
     await uploadQueue.add('process-batch', { batchId: batch.id });
 
     res.status(201).json({
       message: 'File uploaded and batch is queued!',
       batchId: batch.id,
-      candidateCount: candidatesToCreate.length,
+      candidateCount: worksheet.rowCount - 1,
     });
   } catch (error) {
     console.error('Upload failed:', error);
@@ -143,17 +173,91 @@ router.post('/upload', authMiddleware, upload.single('file'), async (req, res) =
   }
 });
 
-// --- ENHANCED: GET /api/uploads (Pagination) ---
+
+// --- GET /api/dashboard/stats ---
+// ... (This code does not change)
+router.get('/dashboard/stats', async (req, res) => {
+  // ... (same as before)
+  try {
+    const { agencyId } = req.user;
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const thirtyDaysAgo = new Date(new Date().setDate(now.getDate() - 30));
+
+    const [
+      totalUploads,
+      pendingUploads,
+      completedToday,
+      recentActivity,
+      thirtyDayStats
+    ] = await prisma.$transaction([
+      prisma.uploadBatch.count({ where: { agencyId: agencyId } }),
+      prisma.uploadBatch.count({ where: { agencyId: agencyId, status: { in: ['pending', 'processing'] } } }),
+      prisma.uploadBatch.count({ where: { agencyId: agencyId, status: 'complete', completedAt: { gte: today } } }),
+      prisma.uploadBatch.findMany({ where: { agencyId: agencyId }, orderBy: { createdAt: 'desc' }, take: 3 }),
+      prisma.uploadBatch.findMany({
+        where: {
+          agencyId: agencyId,
+          status: { in: ['complete', 'failed'] },
+          completedAt: { gte: thirtyDaysAgo }
+        },
+        select: { status: true }
+      })
+    ]);
+
+    let successRate = 'N/A';
+    if (thirtyDayStats.length > 0) {
+      const completed = thirtyDayStats.filter(b => b.status === 'complete').length;
+      successRate = Math.round((completed / thirtyDayStats.length) * 100);
+    }
+
+    res.status(200).json({
+      totalUploads: totalUploads,
+      pendingUploads: pendingUploads,
+      completedToday: completedToday,
+      successRate: successRate,
+      recentActivity: recentActivity
+    });
+  } catch (error) {
+    console.error('Failed to get dashboard stats:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+
+// --- GET /api/uploads/active ---
+// ... (This code does not change)
+router.get('/uploads/active', async (req, res) => {
+  // ... (same as before)
+  try {
+    const { agencyId } = req.user;
+    const activeBatch = await prisma.uploadBatch.findFirst({
+      where: {
+        agencyId: agencyId,
+        status: 'processing',
+      },
+    });
+    res.status(200).json(activeBatch);
+  } catch (error) {
+    console.error('Failed to get active batch:', error);
+    res.status(500).json({ message: 'Internal server error.' });
+  }
+});
+
+
+// --- GET /api/uploads (Pagination) ---
+// ... (This code does not change)
 router.get('/uploads', async (req, res) => {
+  // ... (same as before)
   try {
     const { agencyId } = req.user;
     const { search, status, page = 1, limit = 10 } = req.query;
-
+    
     const where = { agencyId: agencyId };
     if (search) {
       where.OR = [
         { fileName: { contains: search, mode: 'insensitive' } },
-        { portalBatchId: { contains: search, mode: 'insensitive' } }, // <-- Search by portal ID
+        { portalBatchId: { contains: search, mode: 'insensitive' } }
       ];
     }
     if (status) {
@@ -171,7 +275,7 @@ router.get('/uploads', async (req, res) => {
         skip: skip,
         take: limitNum,
       }),
-      prisma.uploadBatch.count({ where: where }),
+      prisma.uploadBatch.count({ where: where })
     ]);
 
     res.status(200).json({
@@ -180,7 +284,7 @@ router.get('/uploads', async (req, res) => {
         totalItems: total,
         currentPage: pageNum,
         totalPages: Math.ceil(total / limitNum),
-      },
+      }
     });
   } catch (error) {
     console.error('Failed to get batches:', error);
@@ -272,15 +376,15 @@ router.get('/dashboard/stats', async (req, res) => {
 
 // --- UPDATED: GET /api/uploads/stats (with Avg. Duration) ---
 router.get('/uploads/stats', async (req, res) => {
+  // ... (same as before)
   try {
     const { agencyId } = req.user;
-
     const allBatches = await prisma.uploadBatch.findMany({
       where: { agencyId: agencyId },
       select: {
         status: true,
-        startedAt: true, // <-- Get new fields
-        completedAt: true, // <-- Get new fields
+        startedAt: true,
+        completedAt: true,
       },
     });
 
@@ -297,7 +401,6 @@ router.get('/uploads/stats', async (req, res) => {
       (batch) => batch.status === 'complete'
     ).length;
 
-    // --- Calculate Avg. Duration ---
     let avgDuration = 'N/A';
     if (finishedBatches.length > 0) {
       finishedBatches.forEach((batch) => {
@@ -309,7 +412,6 @@ router.get('/uploads/stats', async (req, res) => {
 
       if (totalDurationMs > 0) {
         const avgMs = totalDurationMs / finishedBatches.length;
-        // Format to "Xm Ys"
         const totalSeconds = Math.floor(avgMs / 1000);
         const minutes = Math.floor(totalSeconds / 60);
         const seconds = totalSeconds % 60;
@@ -329,7 +431,7 @@ router.get('/uploads/stats', async (req, res) => {
       totalUploads: totalUploads,
       successRate: successRate,
       failedUploads: failedUploads,
-      avgDuration: avgDuration, // <-- Send the calculated value
+      avgDuration: avgDuration,
     });
   } catch (error) {
     console.error('Failed to get upload stats:', error);
@@ -338,7 +440,9 @@ router.get('/uploads/stats', async (req, res) => {
 });
 
 // --- GET /api/uploads/export/csv ---
+// ... (This code does not change)
 router.get('/uploads/export/csv', async (req, res) => {
+  // ... (same as before)
   try {
     const { agencyId } = req.user;
     const { search, status } = req.query;
@@ -361,7 +465,7 @@ router.get('/uploads/export/csv', async (req, res) => {
 
     const columns = [
       { key: 'id', header: 'Internal_Batch_ID' },
-      { key: 'portalBatchId', header: 'Portal_Batch_ID' }, // <-- Add new column
+      { key: 'portalBatchId', header: 'Portal_Batch_ID' },
       { key: 'fileName', header: 'File_Name' },
       { key: 'status', header: 'Status' },
       { key: 'createdAt', header: 'Upload_Date' },
@@ -383,32 +487,29 @@ router.get('/uploads/export/csv', async (req, res) => {
   }
 });
 
-// --- MODIFIED: GET /api/uploads/:batchId ---
-// This route now *only* gets the batch details and summary,
-// NOT the full candidate list. This is much faster.
+
+// --- GET /api/uploads/:batchId ---
+// ... (This code does not change)
 router.get('/uploads/:batchId', async (req, res) => {
+  // ... (same as before)
   try {
     const { agencyId } = req.user;
     const { batchId } = req.params;
 
-    // 1. Get the batch itself
     const batch = await prisma.uploadBatch.findUnique({
       where: { id: batchId },
     });
 
-    // 2. Security check
     if (!batch || batch.agencyId !== agencyId) {
       return res.status(404).json({ message: 'Batch not found.' });
     }
     
-    // 3. Get the candidate counts using an efficient query
     const counts = await prisma.candidate.groupBy({
       by: ['status'],
       where: { batchId: batchId },
       _count: { _all: true },
     });
 
-    // 4. Format the counts into a summary object
     const summary = {
       totalCandidates: 0,
       completed: 0,
@@ -424,7 +525,6 @@ router.get('/uploads/:batchId', async (req, res) => {
       else if (group.status === 'pending') summary.pending = count;
     }
 
-    // 5. Send the batch data + the summary
     res.status(200).json({
       ...batch,
       summary: summary,
@@ -436,16 +536,15 @@ router.get('/uploads/:batchId', async (req, res) => {
 });
 
 
-// --- NEW: GET /api/uploads/:batchId/candidates ---
-// This new route provides the paginated, searchable, and
-// filterable list of candidates for the "Upload Status" page.
+// --- GET /api/uploads/:batchId/candidates ---
+// ... (This code does not change)
 router.get('/uploads/:batchId/candidates', async (req, res) => {
+  // ... (same as before)
   try {
     const { agencyId } = req.user;
     const { batchId } = req.params;
     const { search, status, page = 1, limit = 10 } = req.query;
 
-    // 1. Security Check: Verify this batch belongs to the logged-in user's agency.
     const batch = await prisma.uploadBatch.findUnique({
       where: { id: batchId },
     });
@@ -453,7 +552,6 @@ router.get('/uploads/:batchId/candidates', async (req, res) => {
       return res.status(404).json({ message: 'Batch not found.' });
     }
 
-    // 2. Build the dynamic 'where' clause for filtering candidates
     const where = {
       batchId: batchId,
     };
@@ -461,32 +559,26 @@ router.get('/uploads/:batchId/candidates', async (req, res) => {
       where.status = status;
     }
     if (search) {
-      // Search by Candidate ID or Candidate Name
       where.OR = [
         { candidateId: { contains: search, mode: 'insensitive' } },
         { candidateName: { contains: search, mode: 'insensitive' } },
       ];
     }
 
-    // 3. Get pagination values
     const pageNum = parseInt(page, 10);
     const limitNum = parseInt(limit, 10);
     const skip = (pageNum - 1) * limitNum;
 
-    // 4. Run parallel queries
     const [candidates, total] = await prisma.$transaction([
-      // Query 1: Get the paginated list of candidates
       prisma.candidate.findMany({
         where: where,
         orderBy: { candidateId: 'asc' },
         skip: skip,
         take: limitNum,
       }),
-      // Query 2: Get the total count of candidates that match the filter
       prisma.candidate.count({ where: where }),
     ]);
 
-    // 5. Send the paginated response
     res.status(200).json({
       data: candidates,
       pagination: {

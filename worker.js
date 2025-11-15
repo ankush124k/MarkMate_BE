@@ -20,11 +20,18 @@ const secretKey = process.env.CREDENTIAL_SECRET; // <-- ADD THIS
 const USERNAME_SELECTOR = 'input[formcontrolname="UserName"]';
 const PASSWORD_SELECTOR = 'input[formcontrolname="Password"]';
 
-// --- THE REAL JOB PROCESSOR ---
+// --- THE REAL JOB PROCESSOR (FINAL VERSION) ---
 const processJob = async (job) => {
   const { batchId } = job.data;
   console.log(`[Worker] 🚀 Starting job for batch ID: ${batchId}`);
-  await prisma.uploadBatch.update({ where: { id: batchId }, data: { status: 'processing' }});
+  
+  await prisma.uploadBatch.update({ 
+    where: { id: batchId }, 
+    data: { 
+      status: 'processing',
+      startedAt: new Date()
+    }
+  });
 
   let browser;
   try {
@@ -32,22 +39,24 @@ const processJob = async (job) => {
     const candidates = await prisma.candidate.findMany({
       where: { batchId: batchId, status: 'pending' },
     });
+    
     const batch = await prisma.uploadBatch.findUnique({
       where: { id: batchId },
-    });
-    const credential = await prisma.assessorCredential.findFirst({
-      where: { agencyId: batch.agencyId },
+      include: { assessorCredential: true }
     });
 
-    if (!credential) throw new Error(`No credentials for agency ${batch.agencyId}`);
+    if (!batch.assessorCredential) {
+      throw new Error(`No credential was selected for batch ${batchId}`);
+    }
     
-    // TODO: Decrypt this password!
-    const USERNAME = credential.username; 
-    const PASSWORD = decrypt(credential.password)
+    const USERNAME = batch.assessorCredential.username; 
+    const PASSWORDSsss = decrypt(batch.assessorCredential.password);
+    const PORTAL_BATCH_ID = batch.portalBatchId; 
 
     // 2. --- LAUNCH THE BOT & LOGIN ---
     console.log('[Worker] Launching browser...');
-    browser = await chromium.launch({ headless: true }); // headless: true for production
+    // Set headless: false to watch the bot work
+    browser = await chromium.launch({ headless: true, slowMo: 50 }); 
     const context = await browser.newContext();
     const page = await context.newPage();
     let dashboardPage;
@@ -65,7 +74,6 @@ const processJob = async (job) => {
     console.log('[Worker] Connecting...');
     await page.getByRole('button', { name: 'Connect' }).click();
     await page.waitForSelector('text=Never share your credentials');
-    
     const pagePromise = context.waitForEvent('page');
     await page.locator('a.btn-primary-style2:has-text("Ok")').click();
     dashboardPage = await pagePromise;
@@ -75,39 +83,71 @@ const processJob = async (job) => {
     await assessorTab.waitFor();
     console.log('[Worker] ✅ Login Successful!');
 
-    // 3. --- LOOP THROUGH CANDIDATES ---
+    // 3. --- NAVIGATE TO CANDIDATE LIST (ONCE) ---
+    // This is more efficient. We navigate to the list first.
+    console.log(`[Worker] Navigating to candidate list for batch: ${PORTAL_BATCH_ID}`);
+    await assessorTab.click();
+    await dashboardPage.getByRole('button', { name: 'View Details right icon' }).first().click();
+    await dashboardPage.getByRole('link', { name: 'Assessed Batch Request' }).click();
+    
+    const batchRow = dashboardPage.locator(`tr:has-text("${PORTAL_BATCH_ID}")`); 
+    await batchRow.locator('#dropdownMenuButton').click();
+    await dashboardPage.getByRole('link', { name: 'View Details' }).click();
+    
+    await dashboardPage.getByRole('tab', { name: 'Assessed Candidates' }).click();
+    console.log('[Worker] On candidate list page. Starting uploads...');
+
+    // 4. --- LOOP THROUGH CANDIDATES ---
     for (const candidate of candidates) {
       try {
         console.log(`[Worker] Processing candidate: ${candidate.candidateId}`);
         
-        // --- This is the navigation script from our POC ---
-        await assessorTab.click();
-        await dashboardPage.getByRole('button', { name: 'View Details right icon' }).first().click();
-        await dashboardPage.getByRole('link', { name: 'Assessed Batch Request' }).click();
-        
-        // TODO: Find the real Batch ID from your Excel file, not the POC one.
-        const batchRow = dashboardPage.locator(`tr:has-text("${'42856'}")`); 
-        await batchRow.locator('#dropdownMenuButton').click();
-        await dashboardPage.getByRole('link', { name: 'View Details' }).click();
-        
-        await dashboardPage.getByRole('tab', { name: 'Assessed Candidates' }).click();
-        
+        // --- Find candidate and open marks modal ---
         const candidateRow = dashboardPage.locator(`tr:has-text("${candidate.candidateId}")`);
         await candidateRow.locator('button[aria-label="Action"]').click();
         await dashboardPage.getByRole('menuitem', { name: 'Upload Marks' }).click();
 
-        // --- Fill the marks from the database ---
-        // TODO: Update these selectors to be real
-        const theoryInput = dashboardPage.locator('input[placeholder="Enter Theory Marks"]').first();
-        const practicalInput = dashboardPage.locator('input[placeholder="Enter Practical Marks"]').first();
-        await theoryInput.waitFor();
-        
-        await theoryInput.fill(candidate.nos1_theory_marks.toString());
-        await practicalInput.fill(candidate.nos1_practical_marks.toString());
+        // --- Fill marks from the flexible 'CandidateMark' table ---
+        const marksToFill = await prisma.candidateMark.findMany({
+          where: { candidateId: candidate.id },
+          orderBy: { nosIdentifier: 'asc' }
+        });
 
-        // TODO: Click the "Calculate & Upload" button (and handle errors)
-        // await dashboardPage.getByRole('button', { name: 'Calculate & Upload' }).click();
-        // await dashboardPage.waitForNavigation(); // Wait for it to save
+        // Find all the input boxes *within the modal*
+        // This requires a real selector from the portal
+        const theoryInputs = await dashboardPage.locator('input[placeholder="Enter Theory Marks"]').all();
+        const practicalInputs = await dashboardPage.locator('input[placeholder="Enter Practical Marks"]').all();
+
+        for (let i = 0; i < marksToFill.length; i++) {
+          const mark = marksToFill[i];
+          if (theoryInputs[i] && mark.theoryMarks != null) {
+            await theoryInputs[i].fill(mark.theoryMarks.toString());
+          }
+          if (practicalInputs[i] && mark.practicalMarks != null) {
+            await practicalInputs[i].fill(mark.practicalMarks.toString());
+          }
+        }
+        
+        // --- CLICK UPLOAD AND CHECK FOR ERRORS (TODO IMPLEMENTED) ---
+        await dashboardPage.getByRole('button', { name: 'Calculate & Upload' }).click();
+
+        // Now, we wait. Either the modal closes (success) or an error appears (fail).
+        // We'll race two locators.
+        // TODO: Find the real selector for a portal-side error message.
+        const errorSelector = 'div.portal-error-message'; 
+        
+        const race = await Promise.race([
+          dashboardPage.locator(errorSelector).first().waitFor({ state: 'visible', timeout: 10000 }),
+          dashboardPage.waitForURL(/'Assessed Candidates'/, { timeout: 10000 }) // Wait to be back on the candidate list
+        ]);
+
+        // Check if the error locator won the race
+        const errorText = await race.isVisible() ? await race.textContent() : null;
+
+        if (errorText) {
+          // The portal showed an error
+          throw new Error(errorText);
+        }
 
         // --- Update DB on success ---
         await prisma.candidate.update({
@@ -122,20 +162,40 @@ const processJob = async (job) => {
           where: { id: candidate.id },
           data: { status: 'failed', errorMessage: err.message.substring(0, 255) },
         });
+        
+        // If the upload modal failed, we might still be on it. Go back.
+        try {
+          await dashboardPage.goBack();
+        } catch (navError) {
+          console.error('[Worker] Could not go back, page might have auto-closed.');
+        }
       }
     }
 
-    // 4. --- CLOSE BROWSER AND COMPLETE JOB ---
+    // 5. --- CLOSE BROWSER AND COMPLETE JOB ---
     await browser.close();
-    await prisma.uploadBatch.update({ where: { id: batchId }, data: { status: 'complete' }});
+    await prisma.uploadBatch.update({ 
+      where: { id: batchId }, 
+      data: { 
+        status: 'complete',
+        completedAt: new Date()
+      }
+    });
     console.log(`[Worker] ✅ Finished job for batch ID: ${batchId}`);
     return { success: true, candidatesProcessed: candidates.length };
 
   } catch (error) {
+    // --- Handle *job-level* failure (e.g., login failed) ---
     console.error(`[Worker] ❌❌❌ Job failed for batch ${batchId}:`, error.message);
     if (browser) await browser.close();
-    await prisma.uploadBatch.update({ where: { id: batchId }, data: { status: 'failed' }});
-    throw error; // Re-throw error so BullMQ knows the job failed
+    await prisma.uploadBatch.update({ 
+      where: { id: batchId }, 
+      data: { 
+        status: 'failed',
+        completedAt: new Date()
+      }
+    });
+    throw error;
   }
 };
 
@@ -143,11 +203,10 @@ const processJob = async (job) => {
 console.log('Worker is starting...');
 new Worker(UPLOAD_QUEUE_NAME, processJob, {
   connection,
-  limiter: {
-    max: 1, // Only run 1 job at a time (1 bot)
-    duration: 1000,
-  },
   concurrency: 1, // Process one job at a time
+  limiter: {
+    max: 1, // Max 1 job
+    duration: 1000, // per 1 second
+  },
 });
-
 console.log('Worker is listening for jobs on the queue...');

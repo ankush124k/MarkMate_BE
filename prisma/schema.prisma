@@ -52,44 +52,62 @@ model AssessorCredential {
 
 // Model for a single Excel file upload
 model UploadBatch {
-  id            String    @id @default(cuid())
-  fileName      String
-  portalBatchId String // <-- NEW: The ID from the Skill India Portal (e.g., "42856")
-  status        String    @default("pending") // pending, processing, complete, failed
-  createdAt     DateTime  @default(now())
-  startedAt     DateTime? // <-- NEW: Set when the worker starts the job
-  completedAt   DateTime? // <-- NEW: Set when the worker finishes or fails
+  id                   String                 @id @default(cuid())
+  fileName             String
+  portalBatchId        String
+  status               String                 @default("pending") // pending, processing, complete, failed
+  createdAt            DateTime               @default(now())
+  startedAt            DateTime?
+  completedAt          DateTime?
+  
+  // This new field will store the dynamic headers from the Excel
+  // file, like ["Candidate_ID", "Candidate_Name", "NOS1_Theory", "NOS1_Practical", "NOS2_Theory", ...]
+  excelHeaders         Json?                  
 
   // --- Relationships ---
-  agency    Agency   @relation(fields: [agencyId], references: [id])
-  agencyId  String
+  agency               Agency                 @relation(fields: [agencyId], references: [id])
+  agencyId             String
+  assessorCredential   AssessorCredential?    @relation(fields: [assessorCredentialId], references: [id])
+  assessorCredentialId String?
   
-  // Link to the credential that was used for this job
-  assessorCredential   AssessorCredential? @relation(fields: [assessorCredentialId], references: [id]) // <-- NEW
-  assessorCredentialId String? // <-- NEW: The credential selected by the user
+  // This relationship is still the same
+  candidates           Candidate[]
 
-  candidates Candidate[]
-  
-  @@index([portalBatchId]) // <-- NEW: Add index for searching
+  @@index([portalBatchId])
 }
 
 // Model for a single row in the Excel file
+// ALL 'nos' columns have been DELETED from this model.
 model Candidate {
-  id           String   @id @default(cuid())
-  candidateId  String // e.g., "CAN_2963617"
-  candidateName String? // <-- NEW: "Rajesh Kumar"
-  status       String   @default("pending") // pending, success, failed
-  errorMessage String? // Stores the error if it fails
-  
-  // --- All the data from the Excel file ---
-  nos1_theory_marks    Int?
-  nos1_practical_marks Int?
-  nos2_theory_marks    Int?
-  nos2_practical_marks Int?
-  // ...etc
+  id            String    @id @default(cuid())
+  candidateId   String // e.g., "CAN_2963617"
+  candidateName String? // e.g., "Rajesh Kumar"
+  status        String    @default("pending") // pending, success, failed
+  errorMessage  String?
+  excelRowIndex Int       // We'll use this to remember the original row number
 
+  // --- Relationships ---
   batch    UploadBatch @relation(fields: [batchId], references: [id])
   batchId  String
 
+  // One Candidate can now have MANY marks
+  marks    CandidateMark[] 
+
   @@index([batchId])
+}
+
+// --- NEW TABLE ---
+// Stores the marks for a single NOS for a single candidate
+model CandidateMark {
+  id              String   @id @default(cuid())
+  nosIdentifier   String // e.g., "NOS1" or "NOS2"
+  theoryMarks     Int?
+  practicalMarks  Int?
+
+  // --- Relationships ---
+  // Each mark belongs to one candidate
+  candidate   Candidate @relation(fields: [candidateId], references: [id])
+  candidateId String
+
+  @@index([candidateId])
 }
